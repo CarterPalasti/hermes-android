@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="accent">@color/nous_blue</color>
+    <color name="ic_launcher_background">@color/nous_blue</color>
+    <color name="nous_blue">#0000F2</color>
+    <color name="nous_blue_deep">#0000C4</color>
+    <color name="nous_ink">#0A0A12</color>
+    <color name="nous_snow">#F5F5F5</color>
+    <color name="nous_white">#FFFFFF</color>
+    <color name="primary">@color/nous_blue</color>
+    <color name="primary_dark">@color/nous_blue_deep</color>
+    <string name="app_name">Hermes Agent</string>
+    <style name="Theme.Hermes" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@color/nous_blue</item>
+        <item name="android:navigationBarColor">@color/nous_blue</item>
+        <item name="android:windowBackground">@color/nous_blue</item>
+        <item name="android:colorPrimary">@color/nous_blue</item>
+        <item name="android:colorPrimaryDark">@color/nous_blue_deep</item>
+        <item name="android:colorAccent">@color/nous_blue</item>
+    </style>
+</resources>
