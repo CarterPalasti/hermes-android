@@ -66,6 +66,7 @@ fun SessionsScreen(
     onRename: (HermesSessionSummary, String) -> Unit,
     onDelete: (HermesSessionSummary) -> Unit,
     onExport: (HermesSessionSummary) -> Unit,
+    runningIds: Set<String> = emptySet(),
     modifier: Modifier = Modifier,
 ) {
     var menuFor by remember { mutableStateOf<String?>(null) }
@@ -135,6 +136,7 @@ fun SessionsScreen(
                     SessionCard(
                         s = s,
                         active = s.id == activeSessionId,
+                        running = s.id in runningIds,
                         menuOpen = menuFor == s.id,
                         onOpenMenu = { menuFor = s.id },
                         onDismissMenu = { menuFor = null },
@@ -205,6 +207,7 @@ fun SessionsScreen(
 private fun SessionCard(
     s: HermesSessionSummary,
     active: Boolean,
+    running: Boolean,
     menuOpen: Boolean,
     onOpenMenu: () -> Unit,
     onDismissMenu: () -> Unit,
@@ -234,6 +237,9 @@ private fun SessionCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                if (running) {
+                    Text("RUNNING", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.tertiary)
+                }
                 if (active) {
                     Text("ACTIVE", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                 }

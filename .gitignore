@@ -31,3 +31,4 @@ verify_app_access.py
 verify_lists.py
 BMS_Link_terminal_schedule_draft.md
 _fix_*.py
+_test_*.py

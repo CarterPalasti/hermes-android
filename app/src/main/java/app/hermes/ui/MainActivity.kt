@@ -17,8 +17,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.hermes.ui.components.HermesBrandedBackground
@@ -54,6 +58,8 @@ fun AuthenticatedApp(viewModel: AppViewModel) {
     val connectionState by viewModel.connectionState.collectAsStateWithLifecycle()
     val tab by viewModel.tab.collectAsStateWithLifecycle()
     val models by viewModel.models.collectAsStateWithLifecycle()
+    val pickerModels by viewModel.pickerModels.collectAsStateWithLifecycle()
+    val pickerAllowlist by viewModel.pickerAllowlist.collectAsStateWithLifecycle()
     val sessions by viewModel.sessions.collectAsStateWithLifecycle()
     val selectedModel by viewModel.selectedModel.collectAsStateWithLifecycle()
     val selectedProvider by viewModel.selectedProvider.collectAsStateWithLifecycle()
@@ -68,7 +74,9 @@ fun AuthenticatedApp(viewModel: AppViewModel) {
     val storedSessionId by viewModel.storedSessionId.collectAsStateWithLifecycle()
     val chatScrollEpoch by viewModel.chatScrollEpoch.collectAsStateWithLifecycle()
     val isBusy by viewModel.isBusy.collectAsStateWithLifecycle()
+    val runningSessionIds by viewModel.runningSessionIds.collectAsStateWithLifecycle()
     val pendingApproval by viewModel.pendingApproval.collectAsStateWithLifecycle()
+    val pendingAttachments by viewModel.pendingAttachments.collectAsStateWithLifecycle()
     val profiles by viewModel.profiles.collectAsStateWithLifecycle()
     val profilesError by viewModel.profilesError.collectAsStateWithLifecycle()
     val activeProfileName by viewModel.activeProfileName.collectAsStateWithLifecycle()
@@ -85,6 +93,17 @@ fun AuthenticatedApp(viewModel: AppViewModel) {
     val logsText by viewModel.logsText.collectAsStateWithLifecycle()
     val opsOutput by viewModel.opsOutput.collectAsStateWithLifecycle()
     val manageBusy by viewModel.manageBusy.collectAsStateWithLifecycle()
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_START) {
+                viewModel.onAppForeground()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     var managePage by remember { mutableStateOf(ManagePage.Hub) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -228,7 +247,7 @@ fun AuthenticatedApp(viewModel: AppViewModel) {
                                 isBusy = isBusy,
                                 pendingApproval = pendingApproval,
                                 systemLogs = systemLogs,
-                                models = models,
+                                models = pickerModels,
                                 selectedModel = selectedModel,
                                 selectedProvider = selectedProvider,
                                 contextUsedTokens = contextUsedTokens,
@@ -240,8 +259,11 @@ fun AuthenticatedApp(viewModel: AppViewModel) {
                                 onRespondClarify = viewModel::respondClarify,
                                 onToggleExpanded = viewModel::toggleExpanded,
                                 onSelectModel = viewModel::selectModel,
-                                                                onRefreshModels = viewModel::refreshModels,
-                                                                scrollEpoch = chatScrollEpoch,
+                                onRefreshModels = viewModel::refreshModels,
+                                pendingAttachments = pendingAttachments,
+                                onAddAttachment = viewModel::addAttachmentFromUri,
+                                onRemoveAttachment = viewModel::removeAttachment,
+                                scrollEpoch = chatScrollEpoch,
                                                                 modifier = Modifier.fillMaxSize(),
                                                             )
                             AppTab.Sessions -> SessionsScreen(
@@ -259,6 +281,7 @@ fun AuthenticatedApp(viewModel: AppViewModel) {
                                 onExport = { s ->
                                     viewModel.exportSession(s) { /* body available for share later */ }
                                 },
+                                runningIds = runningSessionIds,
                                 modifier = Modifier.fillMaxSize(),
                             )
                             AppTab.Cron -> CronScreen(
@@ -291,10 +314,14 @@ fun AuthenticatedApp(viewModel: AppViewModel) {
                                     models = models,
                                     selectedModel = selectedModel,
                                     selectedProvider = selectedProvider,
+                                    pickerAllowlist = pickerAllowlist,
                                     isLoading = modelsLoading,
                                     error = modelsError,
                                     onRefresh = viewModel::refreshModels,
                                     onSelect = viewModel::selectModel,
+                                    onTogglePicker = viewModel::toggleChatPickerModel,
+                                    onSetProviderVisible = viewModel::setProviderInChatPicker,
+                                    onResetPicker = viewModel::resetChatPickerToAll,
                                     modifier = Modifier.fillMaxSize(),
                                 )
                                 ManagePage.Profiles -> ProfilesScreen(

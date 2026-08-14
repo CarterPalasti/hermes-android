@@ -40,6 +40,11 @@ class AppViewModel(private val context: Context) : ViewModel() {
     val tab: StateFlow<AppTab> = _tab.asStateFlow()
     private val _models = MutableStateFlow<List<HermesModelOption>>(emptyList())
     val models: StateFlow<List<HermesModelOption>> = _models.asStateFlow()
+    /** Empty allowlist means "show every model in the chat picker". */
+    private val _pickerAllowlist = MutableStateFlow<Set<String>>(emptySet())
+    val pickerAllowlist: StateFlow<Set<String>> = _pickerAllowlist.asStateFlow()
+    private val _pickerModels = MutableStateFlow<List<HermesModelOption>>(emptyList())
+    val pickerModels: StateFlow<List<HermesModelOption>> = _pickerModels.asStateFlow()
     private val _sessions = MutableStateFlow<List<HermesSessionSummary>>(emptyList())
     val sessions: StateFlow<List<HermesSessionSummary>> = _sessions.asStateFlow()
     private val _selectedModel = MutableStateFlow<String?>(null)
@@ -68,8 +73,14 @@ class AppViewModel(private val context: Context) : ViewModel() {
     val chatScrollEpoch: StateFlow<Int> = _chatScrollEpoch.asStateFlow()
     private val _isBusy = MutableStateFlow(false)
     val isBusy: StateFlow<Boolean> = _isBusy.asStateFlow()
+    /** Stored session ids with a live turn still running (including background). */
+    private val _runningSessionIds = MutableStateFlow<Set<String>>(emptySet())
+    val runningSessionIds: StateFlow<Set<String>> = _runningSessionIds.asStateFlow()
+    private val runtimeToStored = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val _pendingApproval = MutableStateFlow(false)
     val pendingApproval: StateFlow<Boolean> = _pendingApproval.asStateFlow()
+    private val _pendingAttachments = MutableStateFlow<List<PendingAttachment>>(emptyList())
+    val pendingAttachments: StateFlow<List<PendingAttachment>> = _pendingAttachments.asStateFlow()
     private val _profiles = MutableStateFlow<List<ProfileUi>>(emptyList())
     val profiles: StateFlow<List<ProfileUi>> = _profiles.asStateFlow()
     private val _profilesError = MutableStateFlow<String?>(null)
@@ -115,6 +126,10 @@ class AppViewModel(private val context: Context) : ViewModel() {
     private fun newId(prefix: String) = "$prefix-${System.currentTimeMillis()}-${idSeq.incrementAndGet()}"
 
     init {
+        viewModelScope.launch {
+            _pickerAllowlist.value = ModelPickerPrefs.load(context)
+            recomputePickerModels()
+        }
         if (DevCredentials.AUTO_LOGIN) {
             login(DevCredentials.GATEWAY_URL, DevCredentials.USERNAME, DevCredentials.PASSWORD)
         }
@@ -174,7 +189,8 @@ class AppViewModel(private val context: Context) : ViewModel() {
         try {
             val options = withContext(Dispatchers.IO) { a.modelOptions().getOrThrow() }
             _models.value = options
-            refreshModelInfoBlocking()
+            recomputePickerModels()
+            refreshModelInfoBlocking(overwriteSelection = _selectedModel.value.isNullOrBlank())
             if (_selectedModel.value.isNullOrBlank()) {
                 val preferred = options.firstOrNull { it.isCurrentProvider }
                     ?: options.firstOrNull()
@@ -190,11 +206,13 @@ class AppViewModel(private val context: Context) : ViewModel() {
         }
     }
 
-    private suspend fun refreshModelInfoBlocking() {
+    private var userPickedModel = false
+
+    private suspend fun refreshModelInfoBlocking(overwriteSelection: Boolean = false) {
         val a = api ?: return
         try {
             val info = withContext(Dispatchers.IO) { a.modelInfo().getOrNull() } ?: return
-            if (info.model.isNotBlank()) {
+            if (overwriteSelection && !userPickedModel && info.model.isNotBlank()) {
                 _selectedModel.value = info.model
                 if (info.provider.isNotBlank()) _selectedProvider.value = info.provider
             }
@@ -223,6 +241,65 @@ class AppViewModel(private val context: Context) : ViewModel() {
                 _modelsLoading.value = false
             }
         }
+    }
+
+    fun isInChatPicker(option: HermesModelOption): Boolean {
+        val allow = _pickerAllowlist.value
+        return allow.isEmpty() || option.pickerKey in allow
+    }
+
+    fun toggleChatPickerModel(option: HermesModelOption) {
+        val all = _models.value
+        if (all.isEmpty()) return
+        val key = option.pickerKey
+        val current = _pickerAllowlist.value
+        val next = if (current.isEmpty()) {
+            // First restriction: start from "all minus this one"
+            all.map { it.pickerKey }.toSet() - key
+        } else if (key in current) {
+            (current - key).ifEmpty { current } // never empty the last one
+        } else {
+            current + key
+        }
+        persistPickerAllowlist(next)
+    }
+
+    fun setProviderInChatPicker(provider: String, visible: Boolean) {
+        val all = _models.value
+        if (all.isEmpty()) return
+        val providerKeys = all.filter { it.provider == provider }.map { it.pickerKey }.toSet()
+        val current = _pickerAllowlist.value
+        val base = if (current.isEmpty()) all.map { it.pickerKey }.toSet() else current
+        val next = if (visible) {
+            base + providerKeys
+        } else {
+            (base - providerKeys).ifEmpty { base }
+        }
+        persistPickerAllowlist(if (next.size == all.size) emptySet() else next)
+    }
+
+    fun resetChatPickerToAll() {
+        persistPickerAllowlist(emptySet())
+    }
+
+    private fun persistPickerAllowlist(keys: Set<String>) {
+        val allKeys = _models.value.map { it.pickerKey }.toSet()
+        val normalized = if (keys.isEmpty() || (allKeys.isNotEmpty() && keys.containsAll(allKeys))) {
+            emptySet()
+        } else {
+            keys
+        }
+        _pickerAllowlist.value = normalized
+        recomputePickerModels()
+        viewModelScope.launch {
+            ModelPickerPrefs.save(context, normalized)
+        }
+    }
+
+    private fun recomputePickerModels() {
+        val allow = _pickerAllowlist.value
+        val all = _models.value
+        _pickerModels.value = if (allow.isEmpty()) all else all.filter { it.pickerKey in allow }
     }
 
     fun refreshSessions() {
@@ -291,31 +368,60 @@ class AppViewModel(private val context: Context) : ViewModel() {
     }
 
     fun selectModel(option: HermesModelOption) {
-            // Optimistic UI update so the strip reflects the pick immediately.
-            _selectedModel.value = option.model
-            _selectedProvider.value = option.provider
-            val a = api
-            viewModelScope.launch {
-                try {
-                    if (a != null) {
-                        withContext(Dispatchers.IO) {
-                            a.setModel(option.provider, option.model, scope = "main").getOrThrow()
-                        }
+        userPickedModel = true
+        _selectedModel.value = option.model
+        _selectedProvider.value = option.provider
+        appendSystem("Model set to ${option.label}")
+        val a = api
+        val client = wsClient
+        val sid = _runtimeSessionId.value
+        viewModelScope.launch {
+            try {
+                if (a != null) {
+                    withContext(Dispatchers.IO) {
+                        a.setModel(option.provider, option.model, scope = "main")
                     }
-                    appendSystem("Model set to ${option.label}")
-                    // Prefer server-confirmed model/context after set.
-                    refreshModelInfoBlocking()
-                    // Keep local selection if info is stale/empty.
-                    if (_selectedModel.value.isNullOrBlank()) {
-                        _selectedModel.value = option.model
-                        _selectedProvider.value = option.provider
-                    }
-                } catch (e: Exception) {
-                    appendSystem("setModel failed: ${e.message}")
-                    // Keep optimistic selection for next session.create even if server set fails.
+                    refreshModelInfoBlocking(overwriteSelection = false)
+                }
+            } catch (e: Exception) {
+                appendSystem("setModel (profile default) failed: ${e.message}")
+            }
+            // Live session keeps its own model unless we switch it here.
+            // Correct /model syntax: "<model> --provider <provider>" — the
+            // "provider/model" slash form is parsed as an aggregator slug and
+            // the switch fails silently (verified live).
+            if (client != null && client.isOpen && !sid.isNullOrBlank()) {
+                val arg = if (option.provider.isNotBlank()) {
+                    "${option.model} --provider ${option.provider}"
+                } else {
+                    option.model
+                }
+                client.sendRequest(
+                    "slash.exec",
+                    mapOf(
+                        "session_id" to sid,
+                        "command" to "/model $arg",
+                    ),
+                ) { result ->
+                    result.fold(
+                        onSuccess = { json ->
+                            val out = json.optString("output", "")
+                            if (out.contains("Model switched", ignoreCase = true) ||
+                                out.contains("switched", ignoreCase = true)
+                            ) {
+                                appendSystem("Session model → ${option.label}")
+                            } else {
+                                appendSystem("Live /model: ${out.lineSequence().firstOrNull()?.trim()?.take(160)}")
+                            }
+                        },
+                        onFailure = { e ->
+                            appendSystem("Live /model failed: ${e.message} — new chats will use this pick")
+                        },
+                    )
                 }
             }
         }
+    }
 
     fun toggleExpanded(id: String) {
         _messages.update { list ->
@@ -323,35 +429,87 @@ class AppViewModel(private val context: Context) : ViewModel() {
         }
     }
 
-    fun newChat() {
-        _tab.value = AppTab.Chat
-        _messages.value = emptyList()
+    private fun rememberRuntime(runtimeId: String?, storedId: String?) {
+        val r = runtimeId?.takeIf { it.isNotBlank() } ?: return
+        val s = storedId?.takeIf { it.isNotBlank() } ?: return
+        runtimeToStored[r] = s
+    }
+
+    private fun markSessionRunning(storedId: String?, running: Boolean) {
+        val id = storedId?.takeIf { it.isNotBlank() } ?: return
+        _runningSessionIds.update { cur -> if (running) cur + id else cur - id }
+    }
+
+    private fun noteSessionFinished(sessionId: String?) {
+        if (sessionId.isNullOrBlank()) return
+        val stored = when {
+            _storedSessionId.value == sessionId -> sessionId
+            _runtimeSessionId.value == sessionId -> _storedSessionId.value
+            else -> runtimeToStored[sessionId]
+        }
+        markSessionRunning(stored, false)
+        if (belongsToActiveChat(sessionId)) {
+            _isBusy.value = false
+        }
+    }
+
+    private fun applyLiveTurnState(json: org.json.JSONObject, storedId: String?) {
+        val running = json.optBoolean("running", false) ||
+            json.optString("status").equals("streaming", ignoreCase = true)
+        _isBusy.value = running
+        markSessionRunning(storedId, running)
+    }
+
+    private var chatEpoch = 0
+
+    private fun belongsToActiveChat(sessionId: String?): Boolean {
+        val active = _runtimeSessionId.value
+        if (active.isNullOrBlank() || sessionId.isNullOrBlank()) return false
+        if (sessionId == active) return true
+        val stored = _storedSessionId.value
+        return !stored.isNullOrBlank() && sessionId == stored
+    }
+
+    /** Leave the current chat without killing a live turn. */
+    private fun detachCurrentSession() {
+        val stored = _storedSessionId.value
+        if (_isBusy.value) markSessionRunning(stored, true)
+        chatEpoch += 1
         streamingAssistantId = null
         streamingThinkingId = null
         _runtimeSessionId.value = null
-        _storedSessionId.value = null
         _isBusy.value = false
         _pendingApproval.value = false
+    }
+
+    fun newChat() {
+        detachCurrentSession()
+        val epoch = chatEpoch
+        _tab.value = AppTab.Chat
+        _messages.value = emptyList()
+        _storedSessionId.value = null
+        _pendingAttachments.value = emptyList()
         recomputeContextUsage()
         appendSystem("New chat")
         // Create a live runtime session tagged source=android so the first
         // prompt.submit can lazily insert a real DB row (Hermes does not
         // persist empty drafts).
         if (_connectionState.value == ConnectionState.OPEN) {
-            createSession(forceNew = true) { }
+            createSession(forceNew = true) {
+                if (epoch != chatEpoch) return@createSession
+            }
         }
     }
 
     fun openStoredSession(summary: HermesSessionSummary) {
+        detachCurrentSession()
+        val epoch = chatEpoch
         _tab.value = AppTab.Chat
         _messages.value = emptyList()
-        streamingAssistantId = null
-        streamingThinkingId = null
-        _isBusy.value = false
-        _pendingApproval.value = false
-        _runtimeSessionId.value = null
+        _pendingAttachments.value = emptyList()
         _storedSessionId.value = summary.id
         if (!summary.model.isNullOrBlank()) {
+            userPickedModel = false
             _selectedModel.value = summary.model
         }
         val client = wsClient
@@ -359,38 +517,43 @@ class AppViewModel(private val context: Context) : ViewModel() {
             val params = mutableMapOf<String, Any?>(
                 "session_id" to summary.id,
                 "source" to "android",
-                // REST hydrates the transcript; keep the WS payload light.
                 "omit_messages" to true,
             )
             summary.profileName?.takeIf { it.isNotBlank() }?.let { params["profile"] = it }
             client.sendRequest("session.resume", params) { result ->
+                if (epoch != chatEpoch) return@sendRequest
                 result.fold(
                     onSuccess = { json ->
+                        if (epoch != chatEpoch) return@fold
                         val sid = json.optString("session_id")
                         if (sid.isNotBlank()) _runtimeSessionId.value = sid
                         val key = json.optString("session_key")
                             .ifBlank { json.optString("resumed") }
                             .ifBlank { summary.id }
                         _storedSessionId.value = key
+                        rememberRuntime(sid, key)
+                        applyLiveTurnState(json, key)
                         val info = json.optJSONObject("info")
                         val infoModel = info?.optString("model").orEmpty()
                         if (infoModel.isNotBlank()) _selectedModel.value = infoModel
                         val infoProvider = info?.optString("provider").orEmpty()
                         if (infoProvider.isNotBlank()) _selectedProvider.value = infoProvider
-                        loadSessionMessages(key, summary.profileName)
+                        loadSessionMessages(key, summary.profileName, epoch)
                         appendSystem("Resumed $key")
                     },
                     onFailure = { e ->
+                        if (epoch != chatEpoch) return@fold
                         appendSystem("Resume failed: ${e.message} — loading transcript only")
-                        loadSessionMessages(summary.id, summary.profileName)
+                        loadSessionMessages(summary.id, summary.profileName, epoch)
                     },
                 )
             }
         } else {
-            loadSessionMessages(summary.id, summary.profileName)
+            loadSessionMessages(summary.id, summary.profileName, epoch)
         }
     }
-    private fun loadSessionMessages(sessionId: String, profileName: String? = null) {
+
+    private fun loadSessionMessages(sessionId: String, profileName: String? = null, epoch: Int = chatEpoch) {
         val a = api ?: return
         viewModelScope.launch {
             try {
@@ -433,8 +596,11 @@ class AppViewModel(private val context: Context) : ViewModel() {
                         toolStatus = if (kind == MessageKind.Tool) "done" else null,
                     )
                 }
+                if (epoch != chatEpoch) return@launch
                 _messages.value = out
-                _storedSessionId.value = sessionId
+                if (_storedSessionId.value.isNullOrBlank()) {
+                    _storedSessionId.value = sessionId
+                }
                 _chatScrollEpoch.value = _chatScrollEpoch.value + 1
                 recomputeContextUsage()
                 appendSystem("Loaded ${out.size} messages from $sessionId")
@@ -457,14 +623,104 @@ class AppViewModel(private val context: Context) : ViewModel() {
             return
         }
         val trimmed = text.trim()
-        if (trimmed.isEmpty()) return
-        appendMessage(ChatMessage(newId("u"), "user", trimmed, kind = MessageKind.Text))
+        val attachments = _pendingAttachments.value
+        if (trimmed.isEmpty() && attachments.isEmpty()) return
+
+        val display = buildString {
+            if (trimmed.isNotEmpty()) append(trimmed)
+            attachments.forEach { a ->
+                if (isNotEmpty()) append('\n')
+                append(
+                    when (a.kind) {
+                        AttachmentKind.IMAGE -> "[image: ${a.name}]"
+                        AttachmentKind.PDF -> "[pdf: ${a.name}]"
+                        AttachmentKind.FILE -> "[file: ${a.name}]"
+                    },
+                )
+            }
+        }
+        appendMessage(ChatMessage(newId("u"), "user", display, kind = MessageKind.Text))
         recomputeContextUsage()
         _isBusy.value = true
+        markSessionRunning(_storedSessionId.value, true)
+
         fun submit(sessionId: String) {
+            attachThenSubmit(client, sessionId, trimmed, attachments)
+        }
+        val existing = _runtimeSessionId.value
+        if (!existing.isNullOrBlank()) submit(existing) else createSession { submit(it) }
+    }
+
+    fun addAttachmentFromUri(uriString: String) {
+        viewModelScope.launch {
+            try {
+                val uri = android.net.Uri.parse(uriString)
+                val item = withContext(Dispatchers.IO) { readAttachment(uri) }
+                if (_pendingAttachments.value.size >= 8) {
+                    appendSystem("Max 8 attachments per turn")
+                    return@launch
+                }
+                _pendingAttachments.update { it + item }
+            } catch (e: Exception) {
+                appendSystem("Attach failed: ${e.message}")
+            }
+        }
+    }
+
+    fun removeAttachment(id: String) {
+        _pendingAttachments.update { list -> list.filterNot { it.id == id } }
+    }
+
+    private fun readAttachment(uri: android.net.Uri): PendingAttachment {
+        val cr = context.contentResolver
+        val mime = cr.getType(uri) ?: "application/octet-stream"
+        var name = uri.lastPathSegment?.substringAfterLast('/') ?: "attachment"
+        cr.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) name = c.getString(idx) ?: name
+            }
+        }
+        val bytes = cr.openInputStream(uri)?.use { it.readBytes() }
+            ?: error("Could not read $name")
+        if (bytes.isEmpty()) error("$name is empty")
+        if (bytes.size > MAX_ATTACH_BYTES) {
+            val mb = MAX_ATTACH_BYTES / (1024 * 1024)
+            error("$name is too large (${bytes.size / (1024 * 1024)} MB; cap ${mb} MB)")
+        }
+        val kind = when {
+            mime.startsWith("image/") -> AttachmentKind.IMAGE
+            mime == "application/pdf" || name.endsWith(".pdf", true) -> AttachmentKind.PDF
+            else -> AttachmentKind.FILE
+        }
+        return PendingAttachment(
+            id = newId("att"),
+            name = name,
+            mimeType = mime,
+            kind = kind,
+            sizeBytes = bytes.size,
+            base64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP),
+        )
+    }
+
+    private fun attachThenSubmit(
+        client: GatewayWsClient,
+        sessionId: String,
+        text: String,
+        attachments: List<PendingAttachment>,
+    ) {
+        fun submitPrompt() {
+            val prompt = text.ifBlank {
+                when {
+                    attachments.any { it.kind == AttachmentKind.IMAGE } -> "Please look at the attached image(s)."
+                    attachments.any { it.kind == AttachmentKind.PDF } -> "Please read the attached PDF."
+                    attachments.isNotEmpty() -> "Please review the attached file(s)."
+                    else -> ""
+                }
+            }
             client.sendRequest(
                 "prompt.submit",
-                mapOf("session_id" to sessionId, "text" to trimmed),
+                mapOf("session_id" to sessionId, "text" to prompt),
             ) { result ->
                 result.onFailure { e ->
                     _isBusy.value = false
@@ -477,8 +733,105 @@ class AppViewModel(private val context: Context) : ViewModel() {
                 }
             }
         }
-        val existing = _runtimeSessionId.value
-        if (!existing.isNullOrBlank()) submit(existing) else createSession { submit(it) }
+
+        fun next(index: Int) {
+            if (index >= attachments.size) {
+                _pendingAttachments.value = emptyList()
+                submitPrompt()
+                return
+            }
+            val a = attachments[index]
+            sendAttachRpc(client, sessionId, a) { ok ->
+                if (ok) next(index + 1)
+                else {
+                    _isBusy.value = false
+                    appendSystem("Stopped before send — attachment failed: ${a.name}")
+                }
+            }
+        }
+        next(0)
+    }
+
+    private fun sendAttachRpc(
+        client: GatewayWsClient,
+        sessionId: String,
+        a: PendingAttachment,
+        onDone: (Boolean) -> Unit,
+    ) {
+        when (a.kind) {
+            AttachmentKind.IMAGE -> {
+                client.sendRequest(
+                    "image.attach_bytes",
+                    mapOf(
+                        "session_id" to sessionId,
+                        "content_base64" to a.base64,
+                        "filename" to a.name,
+                    ),
+                ) { result ->
+                    result.fold(
+                        onSuccess = {
+                            appendSystem("Attached image ${a.name}")
+                            onDone(true)
+                        },
+                        onFailure = { e ->
+                            appendSystem("image.attach_bytes failed (${a.name}): ${e.message}")
+                            onDone(false)
+                        },
+                    )
+                }
+            }
+            AttachmentKind.PDF -> {
+                client.sendRequest(
+                    "pdf.attach",
+                    mapOf(
+                        "session_id" to sessionId,
+                        "content_base64" to a.base64,
+                        "filename" to a.name,
+                    ),
+                ) { result ->
+                    result.fold(
+                        onSuccess = {
+                            appendSystem("Attached PDF ${a.name}")
+                            onDone(true)
+                        },
+                        onFailure = {
+                            // Fallback if poppler isn't on the host.
+                            sendFileAttach(client, sessionId, a, onDone)
+                        },
+                    )
+                }
+            }
+            AttachmentKind.FILE -> sendFileAttach(client, sessionId, a, onDone)
+        }
+    }
+
+    private fun sendFileAttach(
+        client: GatewayWsClient,
+        sessionId: String,
+        a: PendingAttachment,
+        onDone: (Boolean) -> Unit,
+    ) {
+        client.sendRequest(
+            "file.attach",
+            mapOf(
+                "session_id" to sessionId,
+                "name" to a.name,
+                "path" to a.name,
+                "data_url" to "data:${a.mimeType};base64,${a.base64}",
+            ),
+        ) { result ->
+            result.fold(
+                onSuccess = { json ->
+                    val ref = json.optString("ref_text")
+                    appendSystem("Attached file ${a.name}" + if (ref.isNotBlank()) " ($ref)" else "")
+                    onDone(true)
+                },
+                onFailure = { e ->
+                    appendSystem("file.attach failed (${a.name}): ${e.message}")
+                    onDone(false)
+                },
+            )
+        }
     }
 
     fun interrupt() {
@@ -486,6 +839,7 @@ class AppViewModel(private val context: Context) : ViewModel() {
         val sid = _runtimeSessionId.value ?: return
         client.sendRequest("session.interrupt", mapOf("session_id" to sid)) {
             _isBusy.value = false
+            markSessionRunning(_storedSessionId.value, false)
             finalizeThinkingBubble()
             appendSystem("Interrupted")
         }
@@ -525,6 +879,20 @@ class AppViewModel(private val context: Context) : ViewModel() {
     }
 
     fun reconnect() {
+        reconnectInternal(reason = "manual")
+    }
+
+    /** Called when the activity returns to the foreground (e.g. after sleep). */
+    fun onAppForeground() {
+        if (_state.value !is AppState.Authenticated) return
+        val open = _connectionState.value == ConnectionState.OPEN && wsClient?.isOpen == true
+        if (open) return
+        reconnectInternal(reason = "app resumed")
+    }
+
+    private var reconnectGeneration = 0
+
+    private fun reconnectInternal(reason: String) {
         val baseUrl = currentBaseUrl
         val user = lastUsername
         val pass = lastPassword
@@ -532,16 +900,37 @@ class AppViewModel(private val context: Context) : ViewModel() {
             _state.value = AppState.Unauthenticated
             return
         }
+        val gen = ++reconnectGeneration
         viewModelScope.launch {
             _connectionState.value = ConnectionState.CONNECTING
-            LoginHelper(context).login(baseUrl, user, pass).fold(
+            appendSystem("Reconnecting ($reason)…")
+            // Stale runtime ids die with the old socket; keep stored session to resume.
+            _runtimeSessionId.value = null
+            _isBusy.value = false
+            val result = withContext(Dispatchers.IO) {
+                LoginHelper(context).login(baseUrl, user, pass)
+            }
+            if (gen != reconnectGeneration) return@launch
+            result.fold(
                 onSuccess = { ticket ->
                     currentTicket = ticket
                     api = HermesApi(baseUrl)
                     connectWebSocket(baseUrl, ticket)
                 },
-                onFailure = { appendSystem("Reconnect failed: ${it.message}") },
+                onFailure = {
+                    if (gen != reconnectGeneration) return@fold
+                    _connectionState.value = ConnectionState.ERROR
+                    appendSystem("Reconnect failed: ${it.message}")
+                },
             )
+            // Timeout: if still connecting after 20s, surface an error.
+            kotlinx.coroutines.delay(20_000)
+            if (gen == reconnectGeneration &&
+                _connectionState.value == ConnectionState.CONNECTING
+            ) {
+                _connectionState.value = ConnectionState.ERROR
+                appendSystem("Reconnect timed out")
+            }
         }
     }
 
@@ -564,7 +953,10 @@ class AppViewModel(private val context: Context) : ViewModel() {
         _storedSessionId.value = null
         _connectionState.value = ConnectionState.IDLE
         _isBusy.value = false
+        _runningSessionIds.value = emptySet()
+        runtimeToStored.clear()
         _pendingApproval.value = false
+        _pendingAttachments.value = emptyList()
         _tab.value = AppTab.Chat
         _state.value = AppState.Unauthenticated
     }
@@ -771,6 +1163,9 @@ class AppViewModel(private val context: Context) : ViewModel() {
         _connectionState.value = ConnectionState.CONNECTING
         val client = GatewayWsClient(baseUrl = baseUrl, token = null, ticket = ticket)
         wsClient = client
+        client.shouldRetryReconnect = {
+            _state.value is AppState.Authenticated
+        }
         client.onOpen = {
             _connectionState.value = ConnectionState.OPEN
             appendSystem("WebSocket open")
@@ -778,16 +1173,55 @@ class AppViewModel(private val context: Context) : ViewModel() {
         client.onReady = { _ ->
             _connectionState.value = ConnectionState.OPEN
             appendSystem("Gateway ready")
-            ensureSession(forceNew = _runtimeSessionId.value == null)
+            val epoch = chatEpoch
+            val stored = _storedSessionId.value
+            if (!stored.isNullOrBlank()) {
+                client.sendRequest(
+                    "session.resume",
+                    mapOf(
+                        "session_id" to stored,
+                        "source" to "android",
+                        "omit_messages" to true,
+                    ),
+                ) { result ->
+                    if (epoch != chatEpoch) return@sendRequest
+                    result.fold(
+                        onSuccess = { json ->
+                            if (epoch != chatEpoch) return@fold
+                            val sid = json.optString("session_id")
+                            if (sid.isNotBlank()) _runtimeSessionId.value = sid
+                            val key = json.optString("session_key")
+                                .ifBlank { json.optString("resumed") }
+                                .ifBlank { stored }
+                            _storedSessionId.value = key
+                            rememberRuntime(sid, key)
+                            applyLiveTurnState(json, key)
+                            appendSystem("Reattached $key")
+                        },
+                        onFailure = { e ->
+                            if (epoch != chatEpoch) return@fold
+                            appendSystem("Resume after reconnect failed: ${e.message}")
+                            ensureSession(forceNew = true)
+                        },
+                    )
+                }
+            } else if (_runtimeSessionId.value.isNullOrBlank()) {
+                ensureSession(forceNew = true)
+            }
         }
         client.onMessageDelta = { sessionId, text, _ ->
-                    if (!sessionId.isNullOrBlank()) _runtimeSessionId.value = sessionId
-                    // Answer tokens only (thinking.delta is not routed here).
-                    if (text.isNotEmpty() && !isThinkingStatus(text)) appendAssistantDelta(text)
-                }
-                client.onEvent = { type, sessionId, payload ->
-                    if (!sessionId.isNullOrBlank()) _runtimeSessionId.value = sessionId
-                    when (type) {
+            if (belongsToActiveChat(sessionId) && text.isNotEmpty() && !isThinkingStatus(text)) {
+                appendAssistantDelta(text)
+            }
+        }
+        client.onEvent = { type, sessionId, payload ->
+            if (type == "message.complete" || type == "error" ||
+                type == "agent.error" || type == "turn.error"
+            ) {
+                noteSessionFinished(sessionId)
+            }
+            if (type == "gateway.ready" || belongsToActiveChat(sessionId)) {
+            when (type) {
                         "status.update" -> {
                             val t = payload.optString("text", "")
                             // Don't clobber an accumulating thinking stream with status labels.
@@ -831,9 +1265,11 @@ class AppViewModel(private val context: Context) : ViewModel() {
                         }
                         "session.info" -> {
                             val model = payload.optString("model")
-                            if (model.isNotBlank()) _selectedModel.value = model
                             val provider = payload.optString("provider")
-                            if (provider.isNotBlank()) _selectedProvider.value = provider
+                            if (!userPickedModel) {
+                                if (model.isNotBlank()) _selectedModel.value = model
+                                if (provider.isNotBlank()) _selectedProvider.value = provider
+                            }
                             val stored = payload.optString("session_key").ifBlank {
                                 payload.optString("stored_session_id")
                             }
@@ -847,7 +1283,8 @@ class AppViewModel(private val context: Context) : ViewModel() {
                             _isBusy.value = false
                         }
                     }
-                }
+            }
+        }
         client.onError = {
             _connectionState.value = ConnectionState.ERROR
             appendSystem(it ?: "WebSocket error")
@@ -956,6 +1393,7 @@ class AppViewModel(private val context: Context) : ViewModel() {
 
     private fun createSession(forceNew: Boolean = false, onReady: (String) -> Unit) {
         val client = wsClient
+        val epoch = chatEpoch
         if (client == null || !client.isOpen) {
             appendSystem("Cannot create session — not connected")
             return
@@ -978,6 +1416,7 @@ class AppViewModel(private val context: Context) : ViewModel() {
         client.sendRequest("session.create", params) { result ->
             result.fold(
                 onSuccess = { json ->
+                    if (epoch != chatEpoch) return@fold
                     // Runtime id (short) is required for prompt.submit.
                     val sid = json.optString("session_id").ifBlank { json.optString("id") }
                     // Stored key is the durable DB id used by list/CLI/desktop.
@@ -991,11 +1430,19 @@ class AppViewModel(private val context: Context) : ViewModel() {
                     if (stored.isNotBlank()) {
                         _storedSessionId.value = stored
                     }
+                    rememberRuntime(sid, stored.ifBlank { null })
                     val info = json.optJSONObject("info")
                     val infoModel = info?.optString("model").orEmpty()
-                    if (infoModel.isNotBlank()) _selectedModel.value = infoModel
                     val infoProvider = info?.optString("provider").orEmpty()
-                    if (infoProvider.isNotBlank()) _selectedProvider.value = infoProvider
+                    if (userPickedModel) {
+                        // Honor the picker; session.create may echo the profile default.
+                        if (infoModel.isNotBlank()) {
+                            appendSystem("Created with ${infoModel}; keeping picker ${model}")
+                        }
+                    } else {
+                        if (infoModel.isNotBlank()) _selectedModel.value = infoModel
+                        if (infoProvider.isNotBlank()) _selectedProvider.value = infoProvider
+                    }
                     appendSystem(
                         buildString {
                             append("Session $sid")
@@ -1006,8 +1453,9 @@ class AppViewModel(private val context: Context) : ViewModel() {
                     onReady(sid)
                 },
                 onFailure = { e ->
-                    appendSystem("session.create failed: ${e.message}")
-                    _isBusy.value = false
+                if (epoch != chatEpoch) return@fold
+                appendSystem("session.create failed: ${e.message}")
+                _isBusy.value = false
                 },
             )
         }
@@ -1146,5 +1594,8 @@ class AppViewModel(private val context: Context) : ViewModel() {
         }
     }
 
-    companion object { private const val TAG = "AppViewModel" }
+    companion object {
+        private const val TAG = "AppViewModel"
+        private const val MAX_ATTACH_BYTES = 18 * 1024 * 1024
+    }
 }

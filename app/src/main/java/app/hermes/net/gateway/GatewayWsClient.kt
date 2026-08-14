@@ -40,12 +40,15 @@ class GatewayWsClient(
     private val nextId = AtomicLong(1)
     private val pending = ConcurrentHashMap<Long, (Result<JSONObject>) -> Unit>()
     
+    @Volatile
+    private var wantConnected = false
+
     // Auto-reconnect state
     @Volatile
     private var reconnectAttempts = 0
-    private val maxReconnectAttempts = 5
+    private val maxReconnectAttempts = 8
     private val reconnectDelayMs = 2000L
-    
+
     // Callbacks for external integration
     var onOpen: (() -> Unit)? = null
     var onReady: ((String?) -> Unit)? = null
@@ -53,7 +56,7 @@ class GatewayWsClient(
     var onEvent: ((type: String, sessionId: String?, payload: JSONObject) -> Unit)? = null
     var onError: ((String?) -> Unit)? = null
     var onClosed: (() -> Unit)? = null
-    
+
     // External callback for reconnect attempts (to check auth status)
     var shouldRetryReconnect: (() -> Boolean)? = null
 
@@ -62,6 +65,12 @@ class GatewayWsClient(
         private set
 
     fun connect() {
+        wantConnected = true
+        val existing = ws
+        if (existing != null) {
+            try { existing.cancel() } catch (_: Exception) {}
+            ws = null
+        }
         val wsUrl = buildWsUrl(baseUrl, token, ticket)
         Log.i(TAG, "Connecting WS: ${redactTicket(wsUrl)}")
         val request = Request.Builder().url(wsUrl).build()
@@ -136,29 +145,37 @@ class GatewayWsClient(
     }
 
     fun disconnect() {
+        wantConnected = false
         isOpen = false
+        reconnectAttempts = 0
+        mainHandler.removeCallbacksAndMessages(null)
         try {
             ws?.close(1000, "Client disconnect")
         } catch (_: Exception) {
         }
         ws = null
         failAllPending("Disconnected")
-        reconnectAttempts = 0  // Reset on manual disconnect
     }
-    
+
     fun reconnect() {
         Log.i(TAG, "Manual reconnect requested")
+        reconnectAttempts = 0
+        wantConnected = true
         connect()
     }
 
+    fun resetReconnectBudget() {
+        reconnectAttempts = 0
+    }
+
     private fun attemptReconnect() {
+        if (!wantConnected) return
         if (reconnectAttempts >= maxReconnectAttempts) {
             Log.w(TAG, "Max reconnect attempts ($maxReconnectAttempts) reached")
             post { onError?.invoke("Max reconnect attempts reached") }
             return
         }
 
-        // Check if we should retry - only if still authenticated
         val shouldRetry = shouldRetryReconnect?.invoke() ?: true
         if (!shouldRetry) {
             Log.i(TAG, "Skipping auto-reconnect: not authenticated")
@@ -166,11 +183,11 @@ class GatewayWsClient(
         }
 
         reconnectAttempts++
-        val delayMs = reconnectDelayMs * reconnectAttempts
-        Log.i(TAG, "Attempting reconnect #${reconnectAttempts} in ${delayMs}ms")
-        
+        val delayMs = (reconnectDelayMs * reconnectAttempts).coerceAtMost(15_000L)
+        Log.i(TAG, "Attempting reconnect #$reconnectAttempts in ${delayMs}ms")
+
         mainHandler.postDelayed({
-            connect()
+            if (wantConnected && !isOpen) connect()
         }, delayMs)
     }
 
