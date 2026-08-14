@@ -367,58 +367,69 @@ class AppViewModel(private val context: Context) : ViewModel() {
         }
     }
 
+    /** Switch the live chat's model (session-scoped only). */
+    private fun switchLiveSessionModel(option: HermesModelOption) {
+        val client = wsClient
+        val sid = _runtimeSessionId.value
+        if (client == null || !client.isOpen || sid.isNullOrBlank()) return
+        // Correct /model syntax: "<model> --provider <provider>" — the
+        // "provider/model" slash form is parsed as an aggregator slug and
+        // the switch fails silently (verified live).
+        val arg = if (option.provider.isNotBlank()) {
+            "${option.model} --provider ${option.provider}"
+        } else {
+            option.model
+        }
+        client.sendRequest(
+            "slash.exec",
+            mapOf("session_id" to sid, "command" to "/model $arg"),
+        ) { result ->
+            result.fold(
+                onSuccess = { json ->
+                    val out = json.optString("output", "")
+                    if (out.contains("switched", ignoreCase = true)) {
+                        appendSystem("Session model → ${option.label}")
+                    } else {
+                        appendSystem("Live /model: ${out.lineSequence().firstOrNull()?.trim()?.take(160)}")
+                    }
+                },
+                onFailure = { e ->
+                    appendSystem("Live /model failed: ${e.message}")
+                },
+            )
+        }
+    }
+
+    /** In-chat picker: affects ONLY the current chat. */
     fun selectModel(option: HermesModelOption) {
         userPickedModel = true
         _selectedModel.value = option.model
         _selectedProvider.value = option.provider
-        appendSystem("Model set to ${option.label}")
+        appendSystem("Model → ${option.label} (this chat only)")
+        switchLiveSessionModel(option)
+    }
+
+    /** Settings (Manage → Models): change the profile default. */
+    fun setModelDefault(option: HermesModelOption) {
         val a = api
-        val client = wsClient
-        val sid = _runtimeSessionId.value
+        if (a == null) {
+            appendSystem("Not connected")
+            return
+        }
         viewModelScope.launch {
             try {
-                if (a != null) {
-                    withContext(Dispatchers.IO) {
-                        a.setModel(option.provider, option.model, scope = "main")
-                    }
-                    refreshModelInfoBlocking(overwriteSelection = false)
+                withContext(Dispatchers.IO) {
+                    a.setModel(option.provider, option.model, scope = "main").getOrThrow()
                 }
+                userPickedModel = false
+                _selectedModel.value = option.model
+                _selectedProvider.value = option.provider
+                refreshModelInfoBlocking(overwriteSelection = false)
+                appendSystem("Default model → ${option.label}")
+                // Keep any open chat in sync with the new default.
+                switchLiveSessionModel(option)
             } catch (e: Exception) {
-                appendSystem("setModel (profile default) failed: ${e.message}")
-            }
-            // Live session keeps its own model unless we switch it here.
-            // Correct /model syntax: "<model> --provider <provider>" — the
-            // "provider/model" slash form is parsed as an aggregator slug and
-            // the switch fails silently (verified live).
-            if (client != null && client.isOpen && !sid.isNullOrBlank()) {
-                val arg = if (option.provider.isNotBlank()) {
-                    "${option.model} --provider ${option.provider}"
-                } else {
-                    option.model
-                }
-                client.sendRequest(
-                    "slash.exec",
-                    mapOf(
-                        "session_id" to sid,
-                        "command" to "/model $arg",
-                    ),
-                ) { result ->
-                    result.fold(
-                        onSuccess = { json ->
-                            val out = json.optString("output", "")
-                            if (out.contains("Model switched", ignoreCase = true) ||
-                                out.contains("switched", ignoreCase = true)
-                            ) {
-                                appendSystem("Session model → ${option.label}")
-                            } else {
-                                appendSystem("Live /model: ${out.lineSequence().firstOrNull()?.trim()?.take(160)}")
-                            }
-                        },
-                        onFailure = { e ->
-                            appendSystem("Live /model failed: ${e.message} — new chats will use this pick")
-                        },
-                    )
-                }
+                appendSystem("setModel failed: ${e.message}")
             }
         }
     }
@@ -485,6 +496,11 @@ class AppViewModel(private val context: Context) : ViewModel() {
     fun newChat() {
         detachCurrentSession()
         val epoch = chatEpoch
+        userPickedModel = false
+        // A new chat inherits the profile default — don't carry the previous
+        // chat's session-scoped pick into session.create.
+        _selectedModel.value = null
+        _selectedProvider.value = null
         _tab.value = AppTab.Chat
         _messages.value = emptyList()
         _storedSessionId.value = null

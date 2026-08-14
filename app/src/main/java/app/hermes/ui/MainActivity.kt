@@ -318,7 +318,7 @@ fun AuthenticatedApp(viewModel: AppViewModel) {
                                     isLoading = modelsLoading,
                                     error = modelsError,
                                     onRefresh = viewModel::refreshModels,
-                                    onSelect = viewModel::selectModel,
+                                    onSelect = viewModel::setModelDefault,
                                     onTogglePicker = viewModel::toggleChatPickerModel,
                                     onSetProviderVisible = viewModel::setProviderInChatPicker,
                                     onResetPicker = viewModel::resetChatPickerToAll,
