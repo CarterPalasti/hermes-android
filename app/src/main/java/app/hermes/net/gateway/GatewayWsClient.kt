@@ -39,13 +39,23 @@ class GatewayWsClient(
     private var ws: WebSocket? = null
     private val nextId = AtomicLong(1)
     private val pending = ConcurrentHashMap<Long, (Result<JSONObject>) -> Unit>()
-
+    
+    // Auto-reconnect state
+    @Volatile
+    private var reconnectAttempts = 0
+    private val maxReconnectAttempts = 5
+    private val reconnectDelayMs = 2000L
+    
+    // Callbacks for external integration
     var onOpen: (() -> Unit)? = null
     var onReady: ((String?) -> Unit)? = null
     var onMessageDelta: ((sessionId: String?, text: String, payload: JSONObject) -> Unit)? = null
     var onEvent: ((type: String, sessionId: String?, payload: JSONObject) -> Unit)? = null
     var onError: ((String?) -> Unit)? = null
     var onClosed: (() -> Unit)? = null
+    
+    // External callback for reconnect attempts (to check auth status)
+    var shouldRetryReconnect: (() -> Boolean)? = null
 
     @Volatile
     var isOpen: Boolean = false
@@ -60,6 +70,7 @@ class GatewayWsClient(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.i(TAG, "WS opened code=${response.code}")
                 isOpen = true
+                reconnectAttempts = 0  // Reset on successful connect
                 post { onOpen?.invoke() }
             }
 
@@ -81,6 +92,7 @@ class GatewayWsClient(
                 Log.e(TAG, "WS failure: $detail", t)
                 failAllPending(detail)
                 post { onError?.invoke("Connection failed: $detail") }
+                attemptReconnect()
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -93,6 +105,7 @@ class GatewayWsClient(
                 isOpen = false
                 failAllPending("WebSocket closed ($code)")
                 post { onClosed?.invoke() }
+                attemptReconnect()
             }
         })
     }
@@ -130,25 +143,62 @@ class GatewayWsClient(
         }
         ws = null
         failAllPending("Disconnected")
+        reconnectAttempts = 0  // Reset on manual disconnect
+    }
+    
+    fun reconnect() {
+        Log.i(TAG, "Manual reconnect requested")
+        connect()
+    }
+
+    private fun attemptReconnect() {
+        if (reconnectAttempts >= maxReconnectAttempts) {
+            Log.w(TAG, "Max reconnect attempts ($maxReconnectAttempts) reached")
+            post { onError?.invoke("Max reconnect attempts reached") }
+            return
+        }
+
+        // Check if we should retry - only if still authenticated
+        val shouldRetry = shouldRetryReconnect?.invoke() ?: true
+        if (!shouldRetry) {
+            Log.i(TAG, "Skipping auto-reconnect: not authenticated")
+            return
+        }
+
+        reconnectAttempts++
+        val delayMs = reconnectDelayMs * reconnectAttempts
+        Log.i(TAG, "Attempting reconnect #${reconnectAttempts} in ${delayMs}ms")
+        
+        mainHandler.postDelayed({
+            connect()
+        }, delayMs)
     }
 
     private fun parseFrame(message: String) {
         val obj = JSONObject(message)
 
         // RPC response
-        if (obj.has("id") && (obj.has("result") || obj.has("error"))) {
-            val id = obj.optLong("id", -1L)
-            val cb = pending.remove(id)
-            if (obj.has("error")) {
-                val err = obj.getJSONObject("error")
-                val msg = err.optString("message", "RPC error")
-                post { cb?.invoke(Result.failure(Exception(msg))) }
-            } else {
-                val result = obj.optJSONObject("result") ?: JSONObject()
-                post { cb?.invoke(Result.success(result)) }
-            }
-            return
-        }
+                if (obj.has("id") && (obj.has("result") || obj.has("error"))) {
+                    val rawId = obj.opt("id")
+                    val id = when (rawId) {
+                        is Number -> rawId.toLong()
+                        is String -> rawId.toLongOrNull() ?: -1L
+                        else -> obj.optLong("id", -1L)
+                    }
+                    val cb = pending.remove(id)
+                    if (cb == null) {
+                        Log.w(TAG, "No pending callback for RPC id=$rawId (parsed=$id)")
+                    }
+                    if (obj.has("error")) {
+                        val err = obj.optJSONObject("error") ?: JSONObject()
+                        val msg = err.optString("message", "RPC error")
+                        post { cb?.invoke(Result.failure(Exception(msg))) }
+                    } else {
+                        val result = obj.optJSONObject("result") ?: JSONObject()
+                        post { cb?.invoke(Result.success(result)) }
+                    }
+                    return
+                }
 
         // Event frame: {"method":"event","params":{"type":"...","session_id":"...","payload":{...}}}
         if (obj.optString("method") == "event") {
@@ -165,14 +215,21 @@ class GatewayWsClient(
                         onEvent?.invoke(type, sessionId, payload)
                     }
                 }
-                "message.delta", "reasoning.delta", "thinking.delta" -> {
-                    val text = payload.optString("text", "")
-                        .ifBlank { params.optString("text", "") }
-                    if (text.isNotEmpty()) {
-                        post { onMessageDelta?.invoke(sessionId, text, payload) }
-                    }
-                    post { onEvent?.invoke(type, sessionId, payload) }
-                }
+                "message.delta" -> {
+                                    // Answer text only — do not double-fire thinking through onMessageDelta.
+                                    val text = payload.optString("text", "")
+                                        .ifBlank { payload.optString("delta", "") }
+                                        .ifBlank { params.optString("text", "") }
+                                    if (text.isNotEmpty()) {
+                                        post { onMessageDelta?.invoke(sessionId, text, payload) }
+                                    }
+                                    post { onEvent?.invoke(type, sessionId, payload) }
+                                }
+                                "reasoning.delta", "thinking.delta" -> {
+                                    // Thinking tokens go only through onEvent so the VM can append
+                                    // into a single thinking bubble (not finalize+recreate per token).
+                                    post { onEvent?.invoke(type, sessionId, payload) }
+                                }
                 else -> {
                     Log.d(TAG, "event type=$type")
                     post { onEvent?.invoke(type, sessionId, payload) }

@@ -1,0 +1,33 @@
+# Gradle / Android
+.gradle/
+build/
+**/build/
+local.properties
+*.apk
+*.ap_
+*.dex
+*.class
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local secrets / cookies (never commit)
+.hermes_cookie.txt
+.env
+*.pem
+*.keystore
+
+# Misc local junk
+read_auth.py
+verify_app_access.py
+verify_lists.py
+BMS_Link_terminal_schedule_draft.md
+_fix_*.py

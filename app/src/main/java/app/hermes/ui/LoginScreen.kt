@@ -102,7 +102,7 @@ fun LoginScreen(
                 value = url,
                 onValueChange = { url = it },
                 label = { Text("Gateway URL") },
-                placeholder = { Text("http://192.168.1.201:9119") },
+                placeholder = { Text("https://hermes.carter.software") },
                 singleLine = true,
                 enabled = !isLoading,
                 shape = RoundedCornerShape(0.dp),
