@@ -30,6 +30,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -108,6 +111,11 @@ fun LoginScreen(
                 shape = RoundedCornerShape(0.dp),
                 colors = fieldColors,
                 modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Uri,
+                    imeAction = ImeAction.Next,
+                    autoCorrect = false,
+                ),
             )
 
             OutlinedTextField(
@@ -119,6 +127,11 @@ fun LoginScreen(
                 shape = RoundedCornerShape(0.dp),
                 colors = fieldColors,
                 modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Text,
+                    imeAction = ImeAction.Next,
+                    autoCorrect = false,
+                ),
             )
 
             OutlinedTextField(
@@ -131,6 +144,11 @@ fun LoginScreen(
                 shape = RoundedCornerShape(0.dp),
                 colors = fieldColors,
                 modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Password,
+                    imeAction = ImeAction.Done,
+                    autoCorrect = false,
+                ),
             )
 
             if (!errorMessage.isNullOrBlank()) {
