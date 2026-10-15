@@ -12,6 +12,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -30,6 +32,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -107,6 +111,7 @@ fun LoginScreen(
                 enabled = !isLoading,
                 shape = RoundedCornerShape(0.dp),
                 colors = fieldColors,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next),
                 modifier = Modifier.fillMaxWidth(),
             )
 
@@ -118,6 +123,7 @@ fun LoginScreen(
                 enabled = !isLoading,
                 shape = RoundedCornerShape(0.dp),
                 colors = fieldColors,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
                 modifier = Modifier.fillMaxWidth(),
             )
 
@@ -130,6 +136,12 @@ fun LoginScreen(
                 visualTransformation = PasswordVisualTransformation(),
                 shape = RoundedCornerShape(0.dp),
                 colors = fieldColors,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Go),
+                keyboardActions = KeyboardActions(onGo = {
+                    if (!isLoading && url.isNotBlank() && username.isNotBlank() && password.isNotBlank()) {
+                        onLogin(url.trim().trimEnd('/'), username.trim(), password)
+                    }
+                }),
                 modifier = Modifier.fillMaxWidth(),
             )
 
